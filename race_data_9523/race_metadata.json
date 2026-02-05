@@ -1,0 +1,18 @@
+{
+    "session_key": 9523,
+    "reference_start_time": "2024-05-26T13:43:40.121000+00:00",
+    "race_winner": 16,
+    "podium_drivers": [
+        16,
+        81,
+        55
+    ],
+    "fastest_lap": {
+        "driver_number": 44,
+        "lap_number": 63,
+        "lap_time": 74.165,
+        "sector_1": 19.548,
+        "sector_2": 34.854,
+        "sector_3": 19.763
+    }
+}

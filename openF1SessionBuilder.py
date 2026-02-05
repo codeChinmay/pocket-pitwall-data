@@ -10,9 +10,8 @@ import json
 SESSION_KEY = 9523
 DRIVER_LIMIT = 22
 OUTPUT_DIR = f"race_data_{SESSION_KEY}"
-TRACK_MAP_DOWNSAMPLE = 4  # Lower = More detailed track
+TRACK_MAP_DOWNSAMPLE = 4
 
-# Ensure output directories exist
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 os.makedirs(os.path.join(OUTPUT_DIR, "telemetry"), exist_ok=True)
 
@@ -46,19 +45,19 @@ session_result_info = requests.get(session_result_url, params={"session_key": SE
 with open(f"{OUTPUT_DIR}/session_result.json", "w") as f:
     json.dump(session_result_info, f, indent=4)
 
-sorted_results = sorted(session_result_info, key=lambda x: x.get('position', 999))
+# Force 'None' values to 999 so they sort to the bottom
+sorted_results = sorted(session_result_info, key=lambda x: 999 if x.get('position') is None else x.get('position'))
 race_winner = next((d['driver_number'] for d in sorted_results if d.get('position') == 1), None)
 podium_drivers = [d['driver_number'] for d in sorted_results if d.get('position') in [1, 2, 3]]
 valid_starting_grid_drivers = [d['driver_number'] for d in session_result_info if d['number_of_laps'] > 0 and d['dns'] is False]
 
-# D. Laps
+# D. Laps & Fastest Lap Logic
 laps_url = "https://api.openf1.org/v1/laps"
 print("Fetching Laps...")
 all_laps = requests.get(laps_url, params={"session_key": SESSION_KEY}).json()
 with open(f"{OUTPUT_DIR}/laps.json", "w") as f:
     json.dump(all_laps, f, indent=4)
 
-# Logic: Find Fastest Lap (Clean Track)
 valid_laps = [l for l in all_laps if l.get('lap_duration') is not None]
 fastest_lap_entry = min(valid_laps, key=lambda x: x['lap_duration']) if valid_laps else None
 
@@ -83,16 +82,14 @@ with open(f"{OUTPUT_DIR}/starting_grid.json", "w") as f:
 pole_entry = next((item for item in full_starting_grid if item.get('position') == 1), None)
 pole_driver_num = pole_entry.get('driver_number') if pole_entry else drivers_in_session[0]['driver_number']
 
-# F. Stints (Crucial for Pit Detection)
-print("Fetching Stints...")
+# F. Stints, Intervals, Positions
+print("Fetching Stints, Intervals & Positions...")
 stints_url = "https://api.openf1.org/v1/stints"
 all_stints = requests.get(stints_url, params={"session_key": SESSION_KEY}).json()
 with open(f"{OUTPUT_DIR}/stints.json", "w") as f:
     json.dump(all_stints, f, indent=4)
 stints_df_raw = pd.DataFrame(all_stints)
 
-# Fetch Intervals & Positions
-print("Fetching Intervals & Positions...")
 intervals_url = "https://api.openf1.org/v1/intervals"
 all_intervals = requests.get(intervals_url, params={"session_key": SESSION_KEY}).json()
 with open(f"{OUTPUT_DIR}/intervals.json", "w") as f:
@@ -109,7 +106,6 @@ positions_df_raw = pd.DataFrame(all_positions)
 # ==========================================
 # 2. Build Race Metadata
 # ==========================================
-# Determine Race Start Time (from pole sitter's lap 1)
 first_lap_entry = next((item for item in all_laps if item["driver_number"] == pole_driver_num and item["lap_number"] == 1), None)
 if first_lap_entry:
     start_dt_obj = datetime.fromisoformat(first_lap_entry['date_start']) - timedelta(seconds=20)
@@ -130,99 +126,111 @@ with open(f"{OUTPUT_DIR}/race_metadata.json", "w") as f:
 
 
 # ==========================================
-# 2.5. Generate Track Layout (Main + Pit)
+# 2.5. Generate Track Layout + SECTORS
 # ==========================================
-print("Generating Track Layout (with Pitlane)...")
+print("Generating Track Layout & Sectors...")
 
 track_layout = {
     "track_path": [],
     "pit_path": [],
+    "sector_points": [], # Stores X,Y for start of S1, S2, S3
     "bounds": {"min_x": 0, "max_x": 0, "min_y": 0, "max_y": 0}
 }
+
+# Helper to find closest point by time
+def find_closest_point(data, target_dt):
+    # data must be sorted by 'date'
+    closest = min(data, key=lambda x: abs((datetime.fromisoformat(x['date']) - target_dt).total_seconds()))
+    return {"x": closest['x'], "y": closest['y']}
 
 # 1. Main Path (Fastest Lap)
 if fastest_lap_entry:
     fl_driver = fastest_lap_entry['driver_number']
-    fl_start = fastest_lap_entry['date_start']
-    # Add small buffer to ensure we cover the line
-    fl_end_dt = datetime.fromisoformat(fl_start) + timedelta(seconds=fastest_lap_entry['lap_duration'] + 2)
-    fl_end = fl_end_dt.isoformat()
+    fl_start_str = fastest_lap_entry['date_start']
+    fl_start_dt = datetime.fromisoformat(fl_start_str)
     
-    print(f"   -> Fetching Racing Line (Driver {fl_driver}, Lap {fastest_lap_entry['lap_number']})")
+    # Calculate Sector Timestamps
+    s1_dur = fastest_lap_entry.get('duration_sector_1')
+    s2_dur = fastest_lap_entry.get('duration_sector_2')
+    total_dur = fastest_lap_entry.get('lap_duration')
+    
+    fl_end_dt = fl_start_dt + timedelta(seconds=total_dur + 2) # Buffer
+    fl_end_str = fl_end_dt.isoformat()
+    
+    print(f"   -> Fetching Racing Line (Driver {fl_driver})")
     
     loc_url = "https://api.openf1.org/v1/location"
     track_res = requests.get(loc_url, params={
         "session_key": SESSION_KEY, 
         "driver_number": fl_driver, 
-        "date>": fl_start, "date<": fl_end
+        "date>": fl_start_str, "date<": fl_end_str
     })
     
     if track_res.status_code == 200:
         track_data = track_res.json()
         track_data.sort(key=lambda x: x['date'])
         
-        # Downsample
+        # A. Fill Track Path
         for i, point in enumerate(track_data):
             if i % TRACK_MAP_DOWNSAMPLE == 0:
                 track_layout["track_path"].append({"x": point['x'], "y": point['y']})
+        
+        # B. Identify Sector Gates (Start, End S1, End S2)
+        if s1_dur and s2_dur:
+            s1_end_dt = fl_start_dt + timedelta(seconds=s1_dur)
+            s2_end_dt = s1_end_dt + timedelta(seconds=s2_dur)
+            
+            # Start Line (approximate start of lap)
+            p_start = find_closest_point(track_data, fl_start_dt)
+            # End of Sector 1
+            p_s1 = find_closest_point(track_data, s1_end_dt)
+            # End of Sector 2
+            p_s2 = find_closest_point(track_data, s2_end_dt)
+            
+            track_layout["sector_points"] = [
+                {"id": "Start/Finish", "x": p_start['x'], "y": p_start['y']},
+                {"id": "Sector 1 End", "x": p_s1['x'], "y": p_s1['y']},
+                {"id": "Sector 2 End", "x": p_s2['x'], "y": p_s2['y']}
+            ]
+            print(f"   -> Calculated Sector Gates.")
 
-# 2. Pit Path (Find a pit stop)
-# Strategy: Find winner's first pit stop. Get the "In-Lap" and "Out-Lap".
-# This guarantees we capture the pit entry and pit exit geometry.
+# 2. Pit Path
 winner_stints = [s for s in all_stints if s['driver_number'] == race_winner]
 pit_laps_found = False
-
 if len(winner_stints) > 1:
-    # We have a pitstop. Stint 1 ends -> Pit -> Stint 2 starts.
     stint1 = winner_stints[0]
     in_lap_num = stint1['lap_end']
     out_lap_num = stint1['lap_end'] + 1
     
-    # Find start time of In-Lap and end time of Out-Lap
     in_lap_data = next((l for l in all_laps if l['driver_number'] == race_winner and l['lap_number'] == in_lap_num), None)
     out_lap_data = next((l for l in all_laps if l['driver_number'] == race_winner and l['lap_number'] == out_lap_num), None)
     
     if in_lap_data and out_lap_data:
         pit_start = in_lap_data['date_start']
-        # End of out lap
         pit_end_dt = datetime.fromisoformat(out_lap_data['date_start']) + timedelta(seconds=out_lap_data['lap_duration'] + 5)
         pit_end = pit_end_dt.isoformat()
         
-        print(f"   -> Fetching Pit Lane Geometry (Driver {race_winner}, Laps {in_lap_num}-{out_lap_num})")
-        
-        pit_res = requests.get(loc_url, params={
-            "session_key": SESSION_KEY, 
-            "driver_number": race_winner, 
-            "date>": pit_start, "date<": pit_end
-        })
+        print(f"   -> Fetching Pit Lane Geometry (Driver {race_winner})")
+        pit_res = requests.get(loc_url, params={"session_key": SESSION_KEY, "driver_number": race_winner, "date>": pit_start, "date<": pit_end})
         
         if pit_res.status_code == 200:
             pit_data = pit_res.json()
             pit_data.sort(key=lambda x: x['date'])
-            
-            # Downsample less aggressively for pits to keep curves smooth
             for i, point in enumerate(pit_data):
-                if i % (TRACK_MAP_DOWNSAMPLE) == 0:
+                if i % TRACK_MAP_DOWNSAMPLE == 0:
                     track_layout["pit_path"].append({"x": point['x'], "y": point['y']})
             pit_laps_found = True
 
-if not pit_laps_found:
-    print("   -> Warning: No pit data found (Winner might not have pitted or 1-stint data).")
-
-# 3. Calculate Bounds (based on BOTH paths)
+# 3. Calculate Bounds
 all_points = track_layout["track_path"] + track_layout["pit_path"]
 if all_points:
     xs = [p['x'] for p in all_points]
     ys = [p['y'] for p in all_points]
-    track_layout["bounds"] = {
-        "min_x": min(xs), "max_x": max(xs),
-        "min_y": min(ys), "max_y": max(ys)
-    }
+    track_layout["bounds"] = {"min_x": min(xs), "max_x": max(xs), "min_y": min(ys), "max_y": max(ys)}
 
-# Save Layout
 with open(f"{OUTPUT_DIR}/track_layout.json", "w") as f:
     json.dump(track_layout, f, indent=4)
-print(f"   -> Track Layout Saved. (Main points: {len(track_layout['track_path'])}, Pit points: {len(track_layout['pit_path'])})")
+print(f"   -> Track Layout Saved (Sectors Included).")
 
 
 # ==========================================
@@ -237,7 +245,7 @@ for driver in drivers_in_session:
     
     print(f"--- Processing Driver #{d_num} ---")
     
-    # A. Fetch Telemetry (Location + Car Data)
+    # A. Fetch Telemetry
     loc_url = "https://api.openf1.org/v1/location"
     car_url = "https://api.openf1.org/v1/car_data"
     
@@ -270,13 +278,12 @@ for driver in drivers_in_session:
         merged_df = pd.merge_asof(merged_df, d_positions[['date', 'position']], on='date', direction='backward')
 
     # D. Laps
+    laps_df_raw = pd.DataFrame(all_laps)
     d_laps = laps_df_raw[laps_df_raw['driver_number'] == d_num].copy()
     lap_events = []
     for _, lap in d_laps.iterrows():
         try: t_start = pd.to_datetime(lap['date_start'], format='ISO8601')
         except: continue
-        
-        # Add basic lap start
         lap_events.append({'date': t_start, 'lap_number': lap['lap_number'], 'sector_1': np.nan, 'sector_2': np.nan, 'sector_3': np.nan, 'lap_time': np.nan})
         
         curr = t_start
@@ -307,12 +314,10 @@ for driver in drivers_in_session:
     cols = ['date', 'driver_number', 'x', 'y', 'speed', 'rpm', 'n_gear', 'throttle', 'brake', 'drs', 'gap_to_leader', 'interval', 'position', 'lap_number', 'sector_1', 'sector_2', 'sector_3', 'lap_time', 'compound', 'tyre_age']
     final = merged_df[[c for c in cols if c in merged_df.columns]].copy()
     
-    # Time Offset & Fill
     final['time_offset'] = ((final['date'] - start_dt_obj).dt.total_seconds() * 1000).astype(int)
     final = final[['time_offset'] + [c for c in final.columns if c != 'time_offset']]
     final[final.select_dtypes(include=[np.number]).columns] = final.select_dtypes(include=[np.number]).fillna(0)
     final = final.fillna("")
-    
     if 'date' in final.columns: final = final.drop(columns=['date'])
     
     out_path = f"{OUTPUT_DIR}/telemetry/driver_{d_num}.csv"
